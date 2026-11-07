@@ -112,7 +112,10 @@ function marketForMatch(
   const drawn = Array<number>(26).fill(0);
   const starting = rackCounts(rack);
   const market: BidObservation[] = [];
-  for (const result of conn.db.auctionResult.resultByMatch.filter(matchId)) {
+  const results = Array.from(
+    conn.db.auctionResult.resultByMatch.filter(matchId),
+  ).sort((a, b) => Number(a.auctionId - b.auctionId));
+  for (const result of results) {
     const index = ALPHABET.indexOf(result.letter);
     const won = result.winnerBotId === myBotId;
     if (index >= 0) {
@@ -166,12 +169,21 @@ function playTurn(conn: DbConnection) {
       continue;
 
     const myRack = rackForMatch(conn, matchId);
+    const { market, available } = marketForMatch(
+      conn,
+      matchId,
+      myRack,
+      auction.letter,
+    );
     const position = {
       myRack,
       myBalance: Number(participant.balance),
       lexicon,
       bagTotal: match.bagTotal,
       auctionType: match.auctionType.tag,
+      letter: auction.letter,
+      market,
+      available,
     };
     const plays =
       failedWords.get(matchId) === auction.id ? [] : choosePlays(position);
@@ -200,18 +212,7 @@ function playTurn(conn: DbConnection) {
     }
 
     lastBid.set(matchId, auction.id);
-    const { market, available } = marketForMatch(
-      conn,
-      matchId,
-      myRack,
-      auction.letter,
-    );
-    const amount = decideBid({
-      ...position,
-      letter: auction.letter,
-      market,
-      available,
-    });
+    const amount = decideBid(position);
     if (amount === 0) continue;
     conn.reducers
       .submitBid({ auctionId: auction.id, amount: BigInt(amount) })

@@ -44,13 +44,13 @@ test("final cash-out picks disjoint words with a higher total than the best sing
 
 test("holds short words for a bonus while cash is available and liquidates under pressure", () => {
   const position = {
-    myRack: rack("QUARTZ"),
+    myRack: rack("QUARTS"),
     myBalance: 100,
     bagTotal: 40,
-    lexicon: new Lexicon(["QUARTZ"]),
+    lexicon: new Lexicon(["QUARTS"]),
   };
   assert.deepEqual(choosePlays(position), []);
-  assert.equal(choosePlays({ ...position, myBalance: 12 })[0]?.word, "QUARTZ");
+  assert.equal(choosePlays({ ...position, myBalance: 12 })[0]?.word, "QUARTS");
 });
 
 test("penultimate bid goes to a scoring upgrade and final bid is skipped", () => {
@@ -91,6 +91,65 @@ test("second-price bidding pays a premium for a high-face scoring hook", () => {
     decideBid({ ...position, letter: "J" }) >
       decideBid({ ...position, letter: "R" }) + 10,
   );
+});
+
+test("banks PIQUETS when the available upgrades cost more than their extra payout", () => {
+  const position = {
+    myRack: rack("EIPQSTU"),
+    myBalance: 32,
+    bagTotal: 60,
+    lexicon: new Lexicon(["PIQUETS", "PICQUETS", "POSTIQUE"]),
+    auctionType: "Vickrey" as const,
+  };
+  assert.equal(choosePlays(position)[0]?.word, "PIQUETS");
+
+  const market = ["A", "E", "R"].map((letter) => ({
+    letter,
+    paid: 3,
+    result: "lost" as const,
+  }));
+  assert.deepEqual(choosePlays({ ...position, market }), []);
+  const available = Array<number>(26).fill(1);
+  available[2] = 0; // C has already been dealt or auctioned.
+  assert.equal(
+    choosePlays({ ...position, market, available })[0]?.word,
+    "PIQUETS",
+  );
+});
+
+test("banks a higher payout even when it uses fewer letters", () => {
+  const position = {
+    myRack: rack("ABEEHRTYZ"),
+    myBalance: 27,
+    bagTotal: 37,
+    lexicon: new Lexicon(["BREEZY", "BREATHY"]),
+    auctionType: "Vickrey" as const,
+  };
+  assert.equal(choosePlays(position)[0]?.word, "BREEZY");
+});
+
+test("keeps a word intact when the revealed tile is an affordable upgrade", () => {
+  const position = {
+    myRack: rack("JESTER"),
+    myBalance: 10,
+    bagTotal: 13,
+    letter: "S",
+    lexicon: new Lexicon(["JESTER", "JESTERS"]),
+    auctionType: "Vickrey" as const,
+  };
+  assert.deepEqual(choosePlays(position), []);
+  assert.equal(choosePlays({ ...position, myBalance: 7 })[0]?.word, "JESTER");
+});
+
+test("late Vickrey bids cap a stranded Q while paying for a reachable X word", () => {
+  const position = {
+    myBalance: 35,
+    bagTotal: 16,
+    lexicon: new Lexicon(["QAT", "QUA", "EXIT", "TEXT"]),
+    auctionType: "Vickrey" as const,
+  };
+  assert.ok(decideBid({ ...position, myRack: rack("A"), letter: "Q" }) <= 8);
+  assert.ok(decideBid({ ...position, myRack: rack("ET"), letter: "X" }) >= 20);
 });
 
 test("first-price bidding shades a bid for a valuable completion and respects the balance", () => {

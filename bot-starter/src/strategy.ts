@@ -5,6 +5,7 @@ import {
   VALUES,
   cashOut,
   rackCounts,
+  spend,
   type Play,
 } from "./lexicon.js";
 
@@ -19,6 +20,8 @@ export interface Position {
   // Upper bounds after removing public draws and our own starting tiles.
   available?: readonly number[];
   auctionType?: "Vickrey" | "FirstPrice";
+  letter?: string;
+  market?: readonly BidObservation[];
 }
 
 export interface BidObservation {
@@ -30,7 +33,6 @@ export interface BidObservation {
 export interface BidContext extends Position {
   letter: string;
   auctionType: "Vickrey" | "FirstPrice";
-  market?: readonly BidObservation[];
 }
 
 const FLEXIBILITY = [
@@ -145,6 +147,71 @@ function firstPriceBid(ctx: BidContext, letter: number, limit: number): number {
   return bestBid;
 }
 
+function facePricePremium(letter: number): number {
+  return 2.5 * (VALUES[letter] - 1);
+}
+
+function commonTilePrice(market: readonly BidObservation[] = []): number {
+  // Normalize recent public payments to a one-point tile. Losing payments
+  // are a conservative estimate of the price we'd have to beat.
+  const samples = market.slice(-16).flatMap(({ letter, paid }) => {
+    const slot = ALPHABET.indexOf(letter);
+    return slot < 0 ? [] : [Math.max(1, paid - facePricePremium(slot))];
+  });
+  if (samples.length < 3) return 8;
+  samples.sort((a, b) => a - b);
+  return samples[Math.floor(samples.length / 2)];
+}
+
+function hasProfitableUpgrade(
+  ctx: Position,
+  counts: number[],
+  reward: number,
+  commonPrice: number,
+): boolean {
+  let worthWaiting = false;
+  ctx.lexicon.visit(
+    counts,
+    (play, missing) => {
+      if (
+        missing >= 0 &&
+        play.score - reward > commonPrice + facePricePremium(missing)
+      ) {
+        worthWaiting = true;
+      }
+    },
+    ctx.available ?? BAG_COUNTS,
+  );
+  return worthWaiting;
+}
+
+function waitForRevealedTile(
+  ctx: Position,
+  counts: number[],
+  play: Play,
+  commonPrice: number,
+): boolean {
+  const letter = ctx.letter;
+  if (!letter || letter.length !== 1) return false;
+  const slot = ALPHABET.indexOf(letter);
+  if (slot < 0) return false;
+  const price = Math.max(1, Math.ceil(commonPrice + facePricePremium(slot)));
+  if (ctx.myBalance < price) return false;
+
+  // Compare both lines after winning the revealed tile. A payout can break
+  // a better combination even when the remaining letters still make a word.
+  counts[slot]++;
+  const holdScore = cashOut(ctx.lexicon, counts).score;
+  spend(counts, play);
+  const playScore = play.score + cashOut(ctx.lexicon, counts).score;
+  spend(counts, play, 1);
+  counts[slot]--;
+  return (
+    holdScore - playScore >= 7 &&
+    decideBid({ ...ctx, letter, auctionType: "Vickrey" }) >= price
+  );
+}
+
 export function decideBid(ctx: BidContext): number {
   const letter = ALPHABET.indexOf(ctx.letter);
   if (
@@ -210,7 +277,33 @@ export function decideBid(ctx: BidContext): number {
     ((immediate + usefulFuture * (flexibility + scoringPremium)) *
       ((secondPrice ? 0.85 : 1) + 1.25 * urgency)) /
     budgetPressure;
-  const limit = Math.min(ctx.myBalance, Math.max(1, Math.floor(value)));
+  let limit = Math.min(ctx.myBalance, Math.max(1, Math.floor(value)));
+  if (
+    secondPrice &&
+    ctx.bagTotal <= 18 &&
+    face >= 3 &&
+    tileCount <= 4 &&
+    limit > 8
+  ) {
+    // With a thin rack late in the game, a pricey tile should lead to a
+    // meaningful payout with at most one more purchase.
+    let reachable = 0;
+    ctx.lexicon.visit(
+      counts,
+      (play) => {
+        reachable = Math.max(reachable, play.score);
+      },
+      available,
+    );
+    if (reachable < 15)
+      limit = Math.min(limit, Math.max(1, Math.floor(0.7 * reachable)));
+  }
+  if (secondPrice && ctx.bagTotal <= 7 && limit < ctx.myBalance) {
+    const withTile = cashOut(ctx.lexicon, counts).score;
+    counts[letter]--;
+    const gain = Math.max(0, withTile - cashOut(ctx.lexicon, counts).score);
+    limit = Math.min(ctx.myBalance, Math.floor(limit + 0.55 * gain));
+  }
   return ctx.auctionType === "FirstPrice"
     ? firstPriceBid(ctx, letter, limit)
     : limit;
@@ -225,6 +318,7 @@ export function choosePlays(ctx: Position): Play[] {
   // Keep hooks for late acquisitions when we already have enough to bid.
   if (ctx.bagTotal <= 7 && ctx.myBalance >= 6 * ctx.bagTotal) return [];
   const secondPrice = ctx.auctionType !== "FirstPrice";
+  const canWait = ctx.bagTotal > 5 && ctx.myBalance >= 28;
   const minimumLength =
     ctx.myBalance < 7
       ? 2
@@ -240,12 +334,10 @@ export function choosePlays(ctx: Position): Play[] {
   let bestValue = -Infinity;
   ctx.lexicon.visit(counts, (play) => {
     const length = play.letters.length;
-    if (length < minimumLength) return;
-    // At the prices seen in competitive second-price matches, refilling an
-    // empty rack can consume most of a modest payout. Hold a flexible rack
-    // while there is time and enough cash to buy a higher-scoring extension.
+    const largePayout = secondPrice && length >= 5 && play.score >= 42;
+    if (length < minimumLength && !largePayout) return;
     if (secondPrice) {
-      if (ctx.bagTotal > 5 && ctx.myBalance >= 28 && play.score < 57) return;
+      if (canWait && play.score < 50) return;
     } else if (
       length >= 7 &&
       tiles < 10 &&
@@ -264,5 +356,17 @@ export function choosePlays(ctx: Position): Play[] {
       bestValue = value;
     }
   });
+  if (secondPrice && best) {
+    const price = commonTilePrice(ctx.market);
+    // For a strong ready word, wait for a one-tile upgrade only when its
+    // extra payout can cover the expected cost of the missing letter.
+    if (
+      canWait &&
+      best.score < 57 &&
+      hasProfitableUpgrade(ctx, counts, best.score, price)
+    )
+      return [];
+    if (waitForRevealedTile(ctx, counts, best, price)) return [];
+  }
   return best ? [best] : [];
 }
