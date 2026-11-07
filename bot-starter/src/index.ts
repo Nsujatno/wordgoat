@@ -171,6 +171,7 @@ function playTurn(conn: DbConnection) {
       myBalance: Number(participant.balance),
       lexicon,
       bagTotal: match.bagTotal,
+      auctionType: match.auctionType.tag,
     };
     const plays =
       failedWords.get(matchId) === auction.id ? [] : choosePlays(position);
@@ -208,7 +209,6 @@ function playTurn(conn: DbConnection) {
     const amount = decideBid({
       ...position,
       letter: auction.letter,
-      auctionType: match.auctionType.tag,
       market,
       available,
     });

@@ -18,6 +18,7 @@ export interface Position {
   bagTotal: number;
   // Upper bounds after removing public draws and our own starting tiles.
   available?: readonly number[];
+  auctionType?: "Vickrey" | "FirstPrice";
 }
 
 export interface BidObservation {
@@ -184,20 +185,30 @@ export function decideBid(ctx: BidContext): number {
     0,
     3.5 + 1.8 * FLEXIBILITY[letter] + balanceBonus - 1.6 * copies,
   );
+  const secondPrice = ctx.auctionType === "Vickrey";
+  // In a costly field, a face point that makes it into a long word is worth
+  // more than another interchangeable tile. An unsupported Q is risky,
+  // and a second copy of a pricey letter is harder to score.
+  const face = VALUES[letter];
+  const unsupportedQ =
+    ctx.letter === "Q" && !counts[ALPHABET.indexOf("U")] && improvement < 14;
+  const scoringPremium = secondPrice
+    ? 2 * (face - 1) * (unsupportedQ ? 0.35 : 1) * (copies ? 0.5 : 1)
+    : 0;
   const immediate = improvement * (ctx.bagTotal < 8 ? 1.65 : 1.1);
   const urgency = Math.max(0, 1 - ctx.bagTotal / 22);
   // Second-price bids usually cost less than their cap, so the same bank
   // balance can support more aggressive bidding than in first-price play.
-  const desiredBalance =
-    ctx.auctionType === "Vickrey"
-      ? 18 + 0.9 * ctx.bagTotal
-      : 20 + 1.15 * ctx.bagTotal;
+  const desiredBalance = secondPrice
+    ? 18 + 0.9 * ctx.bagTotal
+    : 20 + 1.15 * ctx.bagTotal;
   const budgetPressure = Math.min(
     1.8,
     Math.max(0.7, desiredBalance / (ctx.myBalance + 16)),
   );
   const value =
-    ((immediate + usefulFuture * flexibility) * (1 + 1.25 * urgency)) /
+    ((immediate + usefulFuture * (flexibility + scoringPremium)) *
+      ((secondPrice ? 0.85 : 1) + 1.25 * urgency)) /
     budgetPressure;
   const limit = Math.min(ctx.myBalance, Math.max(1, Math.floor(value)));
   return ctx.auctionType === "FirstPrice"
@@ -213,14 +224,15 @@ export function choosePlays(ctx: Position): Play[] {
 
   // Keep hooks for late acquisitions when we already have enough to bid.
   if (ctx.bagTotal <= 7 && ctx.myBalance >= 6 * ctx.bagTotal) return [];
+  const secondPrice = ctx.auctionType !== "FirstPrice";
   const minimumLength =
     ctx.myBalance < 7
       ? 2
       : ctx.myBalance < 12
         ? 4
-        : tiles >= 15
+        : tiles >= (secondPrice ? 16 : 15)
           ? 5
-          : ctx.myBalance < 23 || tiles >= 13
+          : ctx.myBalance < 23 || tiles >= (secondPrice ? 14 : 13)
             ? 6
             : 7;
 
@@ -229,10 +241,19 @@ export function choosePlays(ctx: Position): Play[] {
   ctx.lexicon.visit(counts, (play) => {
     const length = play.letters.length;
     if (length < minimumLength) return;
-    // With a small rack and plenty of cash, keep high-value tiles available
-    // for a more lucrative bingo unless this one already pays well.
-    if (length >= 7 && tiles < 10 && ctx.myBalance >= 45 && play.score < 36)
+    // At the prices seen in competitive second-price matches, refilling an
+    // empty rack can consume most of a modest payout. Hold a flexible rack
+    // while there is time and enough cash to buy a higher-scoring extension.
+    if (secondPrice) {
+      if (ctx.bagTotal > 5 && ctx.myBalance >= 28 && play.score < 57) return;
+    } else if (
+      length >= 7 &&
+      tiles < 10 &&
+      ctx.myBalance >= 45 &&
+      play.score < 36
+    ) {
       return;
+    }
     const leave = counts.reduce(
       (sum, count, letter) => sum + tileCredit(letter, count),
       0,

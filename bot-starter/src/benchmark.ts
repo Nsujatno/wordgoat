@@ -1,4 +1,14 @@
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmdirSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   ALPHABET,
   BAG_COUNTS,
@@ -11,7 +21,19 @@ import {
 import { choosePlays, decideBid, type BidObservation } from "./strategy.js";
 
 type AuctionType = "Vickrey" | "FirstPrice";
-type Policy = "bot" | "starter" | "hoarder" | "cheap" | "value" | "aggressive";
+type Policy =
+  | "bot"
+  | "old"
+  | "pressure"
+  | "starter"
+  | "hoarder"
+  | "cheap"
+  | "value"
+  | "aggressive";
+type Strategy = {
+  choosePlays: typeof choosePlays;
+  decideBid: typeof decideBid;
+};
 
 interface Player {
   policy: Policy;
@@ -20,6 +42,7 @@ interface Player {
   balance: number;
   score: number;
   wonLast: boolean;
+  market: BidObservation[];
 }
 
 const lexicon = new Lexicon(
@@ -67,31 +90,30 @@ function longest(player: Player, minimum: number): Play[] {
 
 function runMatch(
   seed: number,
-  opponents: Policy[],
+  seats: Policy[],
   auctionType: AuctionType,
+  old?: Strategy,
 ): number[] {
-  const random = randomSource(seed);
+  const drawRandom = randomSource(seed);
+  const random = randomSource(seed ^ 0x67f2b2c7);
   const bag = BAG_COUNTS.flatMap((count, index) =>
     Array<string>(count).fill(ALPHABET[index]),
   );
-  const draw = () => bag.splice(Math.floor(random() * bag.length), 1)[0];
-  const seat = seed % (opponents.length + 1);
-  const policies = [...opponents];
-  policies.splice(seat, 0, "bot");
-  const players = policies.map((policy): Player => ({
+  const draw = () => bag.splice(Math.floor(drawRandom() * bag.length), 1)[0];
+  const players = seats.map((policy): Player => ({
     policy,
     rack: new Map(),
     starting: [],
     balance: 100,
     score: 0,
     wonLast: false,
+    market: [],
   }));
   for (const player of players) {
     for (let i = 0; i < 5; i++) awardTile(player, draw());
     player.starting = rackCounts(player.rack);
   }
   const drawn = Array<number>(26).fill(0);
-  const market: BidObservation[] = [];
 
   while (bag.length > 0) {
     const letter = draw();
@@ -104,35 +126,39 @@ function runMatch(
         let bid: number;
         const copies = player.rack.get(letter) ?? 0;
         switch (player.policy) {
-          case "bot": {
+          case "bot":
+          case "old": {
+            const strategy =
+              player.policy === "old" ? old! : { choosePlays, decideBid };
             const start = performance.now();
             const position = () => ({
               myRack: player.rack,
               myBalance: player.balance,
               lexicon,
               bagTotal: bag.length,
+              auctionType,
             });
             for (
-              let plays = choosePlays(position());
+              let plays = strategy.choosePlays(position());
               plays.length;
-              plays = choosePlays(position())
+              plays = strategy.choosePlays(position())
             )
               playWords(player, plays);
             const available = BAG_COUNTS.map((count, slot) =>
               Math.max(0, count - drawn[slot] - player.starting[slot]),
             );
-            bid = decideBid({
+            bid = strategy.decideBid({
               ...position(),
               letter,
               auctionType,
-              market,
+              market: player.market,
               available,
             });
             timings.push(performance.now() - start);
             break;
           }
           case "starter":
-            if (player.wonLast || market.length === 0)
+            if (player.wonLast || player.market.length === 0)
               playWords(player, longest(player, 2));
             bid = copies ? face : face + 2;
             break;
@@ -147,6 +173,25 @@ function runMatch(
             bid = Math.max(1, 2 * face + (copies ? 0 : 5));
             if (auctionType === "FirstPrice") bid = Math.max(1, bid - 2);
             break;
+          case "pressure": {
+            // Approximate the much higher bid levels in the public replays.
+            if (bag.length === 0) {
+              playWords(
+                player,
+                cashOut(lexicon, rackCounts(player.rack)).plays,
+              );
+              bid = 0;
+              break;
+            }
+            playWords(player, longest(player, player.balance < 15 ? 3 : 7));
+            const jitter = Math.floor(random() * 7) - 3;
+            bid = Math.max(
+              1,
+              Math.round(8 + 2.8 * face + jitter - 2 * copies - (id % 3)),
+            );
+            if (auctionType === "FirstPrice") bid = Math.floor(bid * 0.75);
+            break;
+          }
           default: {
             const jitter = Math.floor(random() * 5) - 2;
             const premium =
@@ -167,13 +212,19 @@ function runMatch(
 
     for (const player of players) player.wonLast = false;
     const [first, second] = bids;
-    if (!first) {
-      market.push({ letter, paid: 0, result: "unbid" });
-      continue;
-    }
-    const paid =
-      auctionType === "FirstPrice" ? first.amount : (second?.amount ?? 1);
-    market.push({ letter, paid, result: first.id === seat ? "won" : "lost" });
+    const paid = !first
+      ? 0
+      : auctionType === "FirstPrice"
+        ? first.amount
+        : (second?.amount ?? 1);
+    players.forEach((player, id) => {
+      player.market.push({
+        letter,
+        paid,
+        result: !first ? "unbid" : first.id === id ? "won" : "lost",
+      });
+    });
+    if (!first) continue;
     const winner = players[first.id];
     winner.balance -= paid;
     awardTile(winner, letter);
@@ -182,10 +233,79 @@ function runMatch(
       playWords(winner, longest(winner, 3));
   }
 
-  return [
-    players[seat].score,
-    ...players.filter((_, id) => id !== seat).map((player) => player.score),
-  ];
+  return players.map((player) => player.score);
+}
+
+async function loadStrategy(ref: string): Promise<Strategy> {
+  const cwd = fileURLToPath(new URL("../..", import.meta.url));
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd, encoding: "utf8" });
+  const commit = git(
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    `${ref}^{commit}`,
+  ).trim();
+  const files = new Map([
+    ["strategy.ts", git("show", `${commit}:bot-starter/src/strategy.ts`)],
+    ["lexicon.ts", git("show", `${commit}:bot-starter/src/lexicon.ts`)],
+    ["package.json", '{"type":"module"}'],
+  ]);
+  const dir = mkdtempSync(join(tmpdir(), "wordgoat-bench-"));
+  const written: string[] = [];
+  try {
+    for (const [name, content] of files) {
+      const file = join(dir, name);
+      writeFileSync(file, content);
+      written.push(file);
+    }
+    return await import(pathToFileURL(join(dir, "strategy.ts")).href);
+  } finally {
+    for (const file of written) unlinkSync(file);
+    rmdirSync(dir);
+  }
+}
+
+function headToHead(ref: string, old: Strategy) {
+  const pairs = 48;
+  for (const { name, others } of [
+    { name: "Two-bot duel", others: [] as Policy[] },
+    {
+      name: "Six-bot pressure table",
+      others: ["pressure", "pressure", "pressure", "pressure"] as Policy[],
+    },
+  ]) {
+    for (const auctionType of ["Vickrey", "FirstPrice"] as const) {
+      let newer = 0,
+        older = 0,
+        ties = 0,
+        first = 0;
+      let newPoints = 0,
+        oldPoints = 0;
+      for (let game = 0; game < pairs; game++) {
+        const seed = (game + 7300) * 7919;
+        for (const seat of [0, 1]) {
+          const seats: Policy[] =
+            seat === 0 ? ["bot", "old", ...others] : ["old", "bot", ...others];
+          const scores = runMatch(seed, seats, auctionType, old);
+          const newScore = scores[seat],
+            oldScore = scores[1 - seat];
+          newer += Number(newScore > oldScore);
+          older += Number(oldScore > newScore);
+          ties += Number(newScore === oldScore);
+          first += Number(
+            scores.every((score, i) => i === seat || newScore > score),
+          );
+          newPoints += newScore;
+          oldPoints += oldScore;
+        }
+      }
+      const games = 2 * pairs;
+      console.log(
+        `${name}, ${auctionType} vs ${ref}: new wins ${newer}, old wins ${older}, ties ${ties}. New placed first ${first}/${games}. Average points ${Math.round(newPoints / games)} vs ${Math.round(oldPoints / games)}.`,
+      );
+    }
+  }
 }
 
 const fields: Record<string, Policy[]> = {
@@ -205,30 +325,40 @@ const fields: Record<string, Policy[]> = {
     "aggressive",
   ],
 };
-const games = 96;
-for (const [field, opponents] of Object.entries(fields)) {
-  for (const auctionType of ["Vickrey", "FirstPrice"] as const) {
-    let wins = 0;
-    let ties = 0;
-    let points = 0;
-    let rivalPoints = 0;
-    for (let game = 1; game <= games; game++) {
-      const [score, ...opponentsScores] = runMatch(
-        (game + 3000) * 7919,
-        opponents,
-        auctionType,
+function benchmarkFields() {
+  const games = 96;
+  for (const [field, opponents] of Object.entries(fields)) {
+    for (const auctionType of ["Vickrey", "FirstPrice"] as const) {
+      let wins = 0;
+      let ties = 0;
+      let points = 0;
+      let rivalPoints = 0;
+      for (let game = 1; game <= games; game++) {
+        const seed = (game + 3000) * 7919;
+        const seat = seed % (opponents.length + 1);
+        const seats = [...opponents];
+        seats.splice(seat, 0, "bot");
+        const scores = runMatch(seed, seats, auctionType);
+        const score = scores[seat];
+        const opponentsScores = scores.filter((_, i) => i !== seat);
+        const bestRival = Math.max(...opponentsScores);
+        wins += Number(score > bestRival);
+        ties += Number(score === bestRival);
+        points += score;
+        rivalPoints += bestRival;
+      }
+      console.log(
+        `${field}, ${auctionType}: ${wins}/${games} outright wins, ${ties} tied; average ${Math.round(points / games)} vs. ${Math.round(rivalPoints / games)} best rival`,
       );
-      const bestRival = Math.max(...opponentsScores);
-      wins += Number(score > bestRival);
-      ties += Number(score === bestRival);
-      points += score;
-      rivalPoints += bestRival;
     }
-    console.log(
-      `${field}, ${auctionType}: ${wins}/${games} outright wins, ${ties} tied; average ${Math.round(points / games)} vs. ${Math.round(rivalPoints / games)} best rival`,
-    );
   }
 }
+
+const [flag, ref] = process.argv.slice(2);
+if (flag === "--against" && ref) headToHead(ref, await loadStrategy(ref));
+else if (flag)
+  throw new Error("Usage: npm run benchmark -- [--against <commit>]");
+else benchmarkFields();
 timings.sort((a, b) => a - b);
 console.log(
   `Strategy time per turn: p95 ${timings[Math.floor(timings.length * 0.95)].toFixed(2)} ms, max ${timings.at(-1)?.toFixed(2)} ms`,

@@ -67,6 +67,32 @@ test("penultimate bid goes to a scoring upgrade and final bid is skipped", () =>
   assert.equal(decideBid({ ...ctx, bagTotal: 0 }), 0);
 });
 
+test("second-price play keeps a modest seven-letter word while there is cash to improve it", () => {
+  const position = {
+    myRack: rack("RETAINS"),
+    myBalance: 40,
+    bagTotal: 35,
+    lexicon: new Lexicon(["RETAINS"]),
+    auctionType: "Vickrey" as const,
+  };
+  assert.deepEqual(choosePlays(position), []);
+  assert.equal(choosePlays({ ...position, myBalance: 20 })[0]?.word, "RETAINS");
+});
+
+test("second-price bidding pays a premium for a high-face scoring hook", () => {
+  const position = {
+    myRack: rack("EALOUS"),
+    myBalance: 100,
+    bagTotal: 45,
+    lexicon: new Lexicon(["JEALOUS", "ZEALOUS", "AEROSOL"]),
+    auctionType: "Vickrey" as const,
+  };
+  assert.ok(
+    decideBid({ ...position, letter: "J" }) >
+      decideBid({ ...position, letter: "R" }) + 10,
+  );
+});
+
 test("first-price bidding shades a bid for a valuable completion and respects the balance", () => {
   const ctx = {
     myRack: rack("QUART"),
