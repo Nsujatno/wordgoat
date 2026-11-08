@@ -19,11 +19,17 @@ import {
   rackCounts,
   type Play,
 } from "./lexicon.js";
-import { choosePlays, decideBid, type BidObservation } from "./strategy.js";
+import {
+  choosePlays,
+  decideBid,
+  type BidContext,
+  type Position,
+  type BidObservation,
+} from "./strategy.js";
 import { botVersions } from "./versions.js";
 
-type AuctionType = "Vickrey" | "FirstPrice";
-type Policy =
+export type AuctionType = "Vickrey" | "FirstPrice";
+export type Policy =
   | Strategy
   | "pressure"
   | "starter"
@@ -31,14 +37,31 @@ type Policy =
   | "cheap"
   | "value"
   | "aggressive";
-interface WordSearch {
+export interface WordSearch {
   lexicon: Lexicon;
   cashOut: typeof cashOut;
 }
 
-interface Strategy extends WordSearch {
-  choosePlays: typeof choosePlays;
-  decideBid: typeof decideBid;
+export interface TournamentPosition {
+  phase: "Swiss" | "Bracket" | "Final";
+  round: number;
+  finalMargin: number;
+}
+
+export interface MatchPosition extends Position {
+  myScore?: number;
+  opponents?: readonly {
+    score: number;
+    balance: number;
+    netTiles: readonly number[];
+  }[];
+  tournament?: TournamentPosition;
+}
+
+export interface Strategy extends WordSearch {
+  choosePlays: (ctx: MatchPosition) => Play[];
+  decideBid: (ctx: MatchPosition & BidContext) => number;
+  rackEventsOnly?: boolean;
 }
 
 interface Entrant {
@@ -54,6 +77,12 @@ interface Player {
   score: number;
   wonLast: boolean;
   market: BidObservation[];
+  netTiles: number[];
+  wins: number;
+  bids: number;
+  spent: number;
+  words: number;
+  lettersPlayed: number;
 }
 
 const lexicon = new Lexicon(
@@ -62,17 +91,19 @@ const lexicon = new Lexicon(
     "utf8",
   ).split(/\r?\n/),
 );
-const current: Entrant = {
+export const current: Entrant = {
   name: "working tree",
   strategy: { lexicon, cashOut, choosePlays, decideBid },
 };
 const timings: number[] = [];
 
-function randomSource(seed: number) {
-  let state = seed;
+export function randomSource(seed: number) {
+  let state = seed >>> 0;
   return () => {
-    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-    return state / 2 ** 32;
+    state = (state + 0x6d2b79f5) | 0;
+    let mix = Math.imul(state ^ (state >>> 15), 1 | state);
+    mix ^= mix + Math.imul(mix ^ (mix >>> 7), 61 | mix);
+    return ((mix ^ (mix >>> 14)) >>> 0) / 2 ** 32;
   };
 }
 
@@ -82,10 +113,16 @@ function awardTile(player: Player, letter: string): void {
 
 function playWords(player: Player, plays: readonly Play[]): void {
   for (const play of plays) {
-    for (const tile of play.word)
-      player.rack.set(tile, player.rack.get(tile)! - 1);
+    for (const tile of play.word) {
+      const count = player.rack.get(tile) ?? 0;
+      if (!count) throw new Error(`Illegal simulated play: ${play.word}`);
+      player.rack.set(tile, count - 1);
+      player.netTiles[ALPHABET.indexOf(tile)]--;
+    }
     player.score += play.score;
     player.balance += play.score;
+    player.words++;
+    player.lettersPlayed += play.word.length;
   }
 }
 
@@ -103,6 +140,12 @@ function longest(lexicon: Lexicon, player: Player, minimum: number): Play[] {
   return best ? [best] : [];
 }
 
+export interface DecisionTimes {
+  bid: number[];
+  word: number[];
+  turn: number[];
+}
+
 function strategyBid(
   strategy: Strategy,
   player: Player,
@@ -110,6 +153,10 @@ function strategyBid(
   auctionType: AuctionType,
   bagTotal: number,
   drawn: readonly number[],
+  opponents: MatchPosition["opponents"],
+  tournament: TournamentPosition | undefined,
+  decisionTimes: DecisionTimes | undefined,
+  recordLegacyTime: boolean,
 ): number {
   const start = performance.now();
   const available = BAG_COUNTS.map((count, slot) =>
@@ -118,33 +165,92 @@ function strategyBid(
   const position = () => ({
     myRack: player.rack,
     myBalance: player.balance,
+    myScore: player.score,
     lexicon: strategy.lexicon,
     bagTotal,
     auctionType,
     letter,
     market: player.market,
     available,
+    opponents,
+    tournament,
   });
-  for (
-    let plays = strategy.choosePlays(position());
-    plays.length;
-    plays = strategy.choosePlays(position())
+  const bidNow = () => {
+    const before = performance.now();
+    const bid = strategy.decideBid(position());
+    decisionTimes?.bid.push(performance.now() - before);
+    if (!Number.isSafeInteger(bid) || bid < 0 || bid > player.balance)
+      throw new Error(
+        `Illegal simulated strategy bid: ${bid} of ${player.balance}`,
+      );
+    return bid;
+  };
+  const openingBid = strategy.rackEventsOnly ? bidNow() : undefined;
+  while (
+    !strategy.rackEventsOnly ||
+    player.wonLast ||
+    player.market.length === 0
   ) {
+    const before = performance.now();
+    const plays = strategy.choosePlays(position());
+    decisionTimes?.word.push(performance.now() - before);
+    if (!plays.length) break;
     playWords(player, plays);
+    if (strategy.rackEventsOnly) break;
   }
-  const bid = strategy.decideBid(position());
-  timings.push(performance.now() - start);
+  const bid = openingBid ?? bidNow();
+  const end = performance.now();
+  decisionTimes?.turn.push(end - start);
+  if (recordLegacyTime) timings.push(end - start);
   return bid;
 }
 
-function runMatch(
+export interface MatchOptions {
+  startingRackSize?: number;
+  measuredSeat?: number;
+  decisionTimes?: DecisionTimes;
+  tournament?: readonly TournamentPosition[];
+  recordLegacyTime?: boolean;
+  skipFinalTurnForSeat?: number;
+}
+
+export function auctionOutcome(
+  bids: readonly { id: number; amount: number; tie: number }[],
+  format: AuctionType,
+) {
+  const [first, second] = bids
+    .filter((bid) => bid.amount > 0)
+    .sort((a, b) => b.amount - a.amount || a.tie - b.tie);
+  return {
+    winner: first?.id,
+    paid: !first
+      ? 0
+      : format === "FirstPrice"
+        ? first.amount
+        : (second?.amount ?? 1),
+  };
+}
+
+export function simulateMatch(
   seed: number,
   seats: Policy[],
   auctionType: AuctionType,
   reference: WordSearch,
-): number[] {
+  options: MatchOptions = {},
+) {
+  const startingRackSize = options.startingRackSize ?? 5;
+  if (
+    seats.length < 2 ||
+    !Number.isInteger(startingRackSize) ||
+    startingRackSize < 0 ||
+    seats.length * startingRackSize >= BAG_COUNTS.reduce((sum, n) => sum + n, 0)
+  )
+    throw new Error(
+      "A simulated match needs two seats and at least one auction",
+    );
   const drawRandom = randomSource(seed);
-  const random = randomSource(seed ^ 0x67f2b2c7);
+  const jitterRandom = randomSource(seed ^ 0x67f2b2c7);
+  const tieRandom = randomSource(seed ^ 0x2c762d63);
   const bag = BAG_COUNTS.flatMap((count, index) =>
     Array<string>(count).fill(ALPHABET[index]),
   );
@@ -158,10 +264,16 @@ function runMatch(
       score: 0,
       wonLast: false,
       market: [],
+      netTiles: Array<number>(26).fill(0),
+      wins: 0,
+      bids: 0,
+      spent: 0,
+      words: 0,
+      lettersPlayed: 0,
     }),
   );
   for (const player of players) {
-    for (let i = 0; i < 5; i++) awardTile(player, draw());
+    for (let i = 0; i < startingRackSize; i++) awardTile(player, draw());
     player.starting = rackCounts(player.rack);
   }
   const drawn = Array<number>(26).fill(0);
@@ -172,101 +284,120 @@ function runMatch(
     const face = LETTER_VALUE[letter];
     const vowel = "AEIOU".includes(letter);
     drawn[index]++;
-    const bids = players
-      .map((player, id) => {
-        let bid: number;
-        const copies = player.rack.get(letter) ?? 0;
-        switch (player.policy) {
-          case "starter":
-            if (player.wonLast || player.market.length === 0)
-              playWords(player, longest(reference.lexicon, player, 2));
-            bid = copies ? face : face + 2;
-            break;
-          case "hoarder":
-            if (bag.length === 0)
-              playWords(
-                player,
-                reference.cashOut(reference.lexicon, rackCounts(player.rack))
-                  .plays,
-              );
-            else
-              playWords(
-                player,
-                longest(reference.lexicon, player, player.balance < 18 ? 3 : 7),
-              );
-            bid = Math.max(1, 2 * face + (copies ? 0 : 5));
-            if (auctionType === "FirstPrice") bid = Math.max(1, bid - 2);
-            break;
-          case "pressure": {
-            // Approximate the much higher bid levels in the public replays.
-            if (bag.length === 0) {
-              playWords(
-                player,
-                reference.cashOut(reference.lexicon, rackCounts(player.rack))
-                  .plays,
-              );
-              bid = 0;
-              break;
-            }
+    // Snapshot at open. A policy never sees another seat's simultaneous play
+    // or bid, and has no access to opponents' initial deal.
+    const visible = players.map(({ score, balance, netTiles }) => ({
+      score,
+      balance,
+      netTiles: [...netTiles],
+    }));
+    const bids = players.map((player, id) => {
+      let bid: number;
+      const copies = player.rack.get(letter) ?? 0;
+      const jitter = jitterRandom();
+      const tie = tieRandom();
+      if (bag.length === 0 && options.skipFinalTurnForSeat === id)
+        return { id, amount: 0, tie };
+      switch (player.policy) {
+        case "starter":
+          bid = copies ? face : face + 2;
+          bid = Math.min(player.balance, bid);
+          if (player.wonLast || player.market.length === 0)
+            playWords(player, longest(reference.lexicon, player, 2));
+          break;
+        case "hoarder":
+          if (bag.length === 0)
             playWords(
               player,
-              longest(reference.lexicon, player, player.balance < 15 ? 3 : 7),
+              reference.cashOut(reference.lexicon, rackCounts(player.rack))
+                .plays,
             );
-            const jitter = Math.floor(random() * 7) - 3;
-            bid = Math.max(
-              1,
-              Math.round(8 + 2.8 * face + jitter - 2 * copies - (id % 3)),
+          else
+            playWords(
+              player,
+              longest(reference.lexicon, player, player.balance < 18 ? 3 : 7),
             );
-            if (auctionType === "FirstPrice") bid = Math.floor(bid * 0.75);
+          bid = Math.max(1, 2 * face + (copies ? 0 : 5));
+          if (auctionType === "FirstPrice") bid = Math.max(1, bid - 2);
+          break;
+        case "pressure": {
+          // Approximate the much higher bid levels in the public replays.
+          if (bag.length === 0) {
+            playWords(
+              player,
+              reference.cashOut(reference.lexicon, rackCounts(player.rack))
+                .plays,
+            );
+            bid = 0;
             break;
           }
-          default: {
-            if (typeof player.policy === "object") {
-              bid = strategyBid(
-                player.policy,
-                player,
-                letter,
-                auctionType,
-                bag.length,
-                drawn,
-              );
-            } else {
-              const jitter = Math.floor(random() * 5) - 2;
-              const premium =
-                player.policy === "aggressive"
-                  ? vowel
-                    ? 4
-                    : 2
-                  : player.policy === "cheap"
-                    ? -1
-                    : 0;
-              bid = Math.max(1, face + premium + jitter);
-            }
+          playWords(
+            player,
+            longest(reference.lexicon, player, player.balance < 15 ? 3 : 7),
+          );
+          bid = Math.max(
+            1,
+            Math.round(
+              8 +
+                2.8 * face +
+                Math.floor(jitter * 7) -
+                3 -
+                2 * copies -
+                (id % 3),
+            ),
+          );
+          if (auctionType === "FirstPrice") bid = Math.floor(bid * 0.75);
+          break;
+        }
+        default: {
+          if (typeof player.policy === "object") {
+            bid = strategyBid(
+              player.policy,
+              player,
+              letter,
+              auctionType,
+              bag.length,
+              drawn,
+              visible.filter((_, seat) => seat !== id),
+              options.tournament?.[id],
+              options.measuredSeat === id ? options.decisionTimes : undefined,
+              options.recordLegacyTime ?? false,
+            );
+          } else {
+            const premium =
+              player.policy === "aggressive"
+                ? vowel
+                  ? 4
+                  : 2
+                : player.policy === "cheap"
+                  ? -1
+                  : 0;
+            bid = Math.max(1, face + premium + Math.floor(jitter * 5) - 2);
           }
         }
-        return { id, amount: Math.min(player.balance, bid), tie: random() };
-      })
-      .filter((bid) => bid.amount > 0)
-      .sort((a, b) => b.amount - a.amount || a.tie - b.tie);
+      }
+      const amount = Math.min(player.balance, bid);
+      if (amount > 0) player.bids++;
+      return { id, amount, tie };
+    });
 
     for (const player of players) player.wonLast = false;
-    const [first, second] = bids;
-    const paid = !first
-      ? 0
-      : auctionType === "FirstPrice"
-        ? first.amount
-        : (second?.amount ?? 1);
+    const { winner: winnerId, paid } = auctionOutcome(bids, auctionType);
     players.forEach((player, id) => {
       player.market.push({
         letter,
         paid,
-        result: !first ? "unbid" : first.id === id ? "won" : "lost",
+        result:
+          winnerId === undefined ? "unbid" : winnerId === id ? "won" : "lost",
       });
     });
-    if (!first) continue;
-    const winner = players[first.id];
+    if (winnerId === undefined) continue;
+    const winner = players[winnerId];
     winner.balance -= paid;
+    winner.spent += paid;
+    winner.wins++;
     awardTile(winner, letter);
+    winner.netTiles[index]++;
     winner.wonLast = true;
     if (
       winner.policy === "cheap" ||
@@ -276,7 +407,29 @@ function runMatch(
       playWords(winner, longest(reference.lexicon, winner, 3));
   }
 
-  return players.map((player) => player.score);
+  return players.map(
+    ({ score, balance, wins, bids, spent, words, lettersPlayed, market }) => ({
+      score,
+      balance,
+      wins,
+      bids,
+      spent,
+      words,
+      lettersPlayed,
+      auctions: market.length,
+    }),
+  );
+}
+
+function runMatch(
+  seed: number,
+  seats: Policy[],
+  format: AuctionType,
+  reference: WordSearch,
+) {
+  return simulateMatch(seed, seats, format, reference, {
+    recordLegacyTime: true,
+  }).map(({ score }) => score);
 }
 
 export async function loadStrategy(ref: string): Promise<Strategy> {

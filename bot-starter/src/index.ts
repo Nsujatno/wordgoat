@@ -27,8 +27,9 @@ import {
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { ALPHABET, BAG_COUNTS, Lexicon, rackCounts } from "./lexicon.js";
-import { choosePlays, decideBid, type BidObservation } from "./strategy.js";
+import { ALPHABET, BAG_COUNTS, LETTER_VALUE, rackCounts } from "./lexicon.js";
+import { type BidObservation } from "./strategy.js";
+import { TurnPlanner } from "./turn-planner.js";
 import "dotenv/config";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
@@ -50,14 +51,14 @@ function saveToken(tok: string) {
   fs.writeFileSync(TOKEN_PATH, tok);
 }
 
-const dictionary = fs.readFileSync(
-  new URL("../../spacetimedb/wordlist.txt", import.meta.url),
-  "utf8",
-);
-const lexicon = new Lexicon(dictionary.split(/\r?\n/));
+const planner = new TurnPlanner();
+const BID_MARGIN_MS = 160;
 
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
+let connection: DbConnection | undefined;
+let token = BOT_TOKEN ?? loadToken();
+let reconnectDelay = 500;
 let ready = false;
 let turnQueued = false;
 let lifecycleQueued = false;
@@ -70,9 +71,16 @@ const matchFeeds = new Map<
   bigint,
   { handle: SubscriptionHandle; applied: boolean }
 >();
-const lastBid = new Map<bigint, bigint>();
+interface Turn {
+  auctionId: bigint;
+  participantId: bigint;
+  deadline: number;
+  timer: ReturnType<typeof setTimeout>;
+  searching: boolean;
+  bid?: bigint;
+}
+const turns = new Map<bigint, Turn>();
 const pendingWords = new Set<bigint>();
-const failedWords = new Map<bigint, bigint>();
 
 function resolveMyBotId(conn: DbConnection): bigint | null {
   if (!myIdentity) return null;
@@ -147,7 +155,7 @@ function marketForMatch(
 }
 
 function queueTurn(conn: DbConnection) {
-  if (!ready || turnQueued) return;
+  if (conn !== connection || !ready || turnQueued) return;
   turnQueued = true;
   queueMicrotask(() => {
     turnQueued = false;
@@ -156,17 +164,59 @@ function queueTurn(conn: DbConnection) {
 }
 
 function playTurn(conn: DbConnection) {
-  if (!ready) return;
+  if (conn !== connection || !ready) return;
   for (const participant of conn.db.matchParticipant.iter()) {
     const { matchId } = participant;
-    if (!matchFeeds.get(matchId)?.applied || pendingWords.has(matchId))
-      continue;
+    if (!matchFeeds.get(matchId)?.applied) continue;
     const match = conn.db.matchState.id.find(matchId);
     if (match?.status.tag !== "Running" || match.currentAuctionId === undefined)
       continue;
     const auction = conn.db.auction.id.find(match.currentAuctionId);
-    if (auction?.status.tag !== "Open" || lastBid.get(matchId) === auction.id)
-      continue;
+    if (auction?.status.tag !== "Open") continue;
+    const previous = turns.get(matchId);
+    if (previous?.auctionId !== auction.id) {
+      clearTimeout(previous?.timer);
+      // Server timestamps determine the window length. Start a monotonic
+      // local budget on receipt so clock skew cannot suppress every bid.
+      const windowMs = Number(
+        auction.closesAt.microsSinceUnixEpoch - auction.opensAt.microsSinceUnixEpoch,
+      ) / 1000;
+      const deadline = performance.now() + windowMs;
+      const timer = setTimeout(
+        () => {
+          // Keep a small legal bid in flight if search or word confirmation
+          // runs long. The penultimate bid is already handled at open, and
+          // only word plays matter in the final window.
+          if (match.bagTotal <= 1) return;
+          const turn = turns.get(matchId);
+          if (turn?.auctionId === auction.id && turn.bid === undefined) {
+            console.warn(
+              `[${BOT_NAME}] using deadline bid for auction ${auction.id}`,
+            );
+            submitTurnBid(
+              conn,
+              matchId,
+              turn,
+              Math.min(3, LETTER_VALUE[auction.letter]),
+            );
+          }
+        },
+        Math.max(0, windowMs - BID_MARGIN_MS),
+      );
+      const turn = {
+        auctionId: auction.id,
+        participantId: participant.id,
+        deadline,
+        timer,
+        searching: false,
+      };
+      turns.set(matchId, turn);
+      if (match.bagTotal === 1)
+        submitTurnBid(conn, matchId, turn, Number(participant.balance));
+    }
+    const turn = turns.get(matchId)!;
+    if (turn.searching || pendingWords.has(matchId) || planner.busy) continue;
+    turn.searching = true;
 
     const myRack = rackForMatch(conn, matchId);
     const { market, available } = marketForMatch(
@@ -178,54 +228,125 @@ function playTurn(conn: DbConnection) {
     const position = {
       myRack,
       myBalance: Number(participant.balance),
-      lexicon,
       bagTotal: match.bagTotal,
       auctionType: match.auctionType.tag,
       letter: auction.letter,
       market,
       available,
     };
-    const plays =
-      failedWords.get(matchId) === auction.id ? [] : choosePlays(position);
-    if (plays.length > 0) {
-      pendingWords.add(matchId);
-      // Final cash-out words are disjoint, so send the entire plan within
-      // the auction window without a network round trip between words.
-      const submissions = plays.map(({ word, score }) => {
-        console.log(
-          `[${BOT_NAME}] match ${matchId}: playing '${word}' for ${score}`,
+    void planner
+      .plan({ position, playWords: true })
+      .then(async ({ plays, bid }) => {
+        const live = activeParticipant(conn, matchId, turn);
+        if (!live) return;
+        if (
+          live.score !== participant.score ||
+          live.balance !== participant.balance
+        ) {
+          turn.searching = false;
+          queueTurn(conn);
+          return;
+        }
+        clearTimeout(turn.timer);
+        submitTurnBid(conn, matchId, turn, bid);
+        if (!plays.length) return;
+        pendingWords.add(matchId);
+        const results = await Promise.allSettled(
+          plays.map(({ word, score }) => {
+            console.log(
+              `[${BOT_NAME}] match ${matchId}: playing '${word}' for ${score}`,
+            );
+            return conn.reducers.submitWord({ matchId, word });
+          }),
         );
-        return conn.reducers
-          .submitWord({ matchId, word })
-          .catch((error: unknown) => {
-            if (conn.db.matchState.id.find(matchId)?.status.tag === "Running") {
-              failedWords.set(matchId, auction.id);
-            }
-            logFailure(`playing '${word}'`)(error);
-          });
-      });
-      void Promise.all(submissions).then(() => {
+        if (connection !== conn) return;
         pendingWords.delete(matchId);
+        if (results.some((result) => result.status === "rejected")) {
+          for (const result of results) {
+            if (result.status === "rejected")
+              logFailure(
+                `playing word in match ${matchId}, auction ${auction.id}`,
+              )(result.reason);
+          }
+          const refreshed = activeParticipant(conn, matchId, turn);
+          if (refreshed) {
+            const refreshedPosition = {
+              ...position,
+              myRack: rackForMatch(conn, matchId),
+              myBalance: Number(refreshed.balance),
+            };
+            void planner
+              .plan({ position: refreshedPosition, playWords: false })
+              .then(({ bid }) => submitTurnBid(conn, matchId, turn, bid))
+              .catch(logFailure("recomputing bid"))
+              .finally(() => queueTurn(conn));
+          }
+        } else {
+          submitTurnBid(conn, matchId, turn, bid);
+        }
         queueTurn(conn);
-      });
-      continue;
-    }
-
-    lastBid.set(matchId, auction.id);
-    const amount = decideBid(position);
-    if (amount === 0) continue;
-    conn.reducers
-      .submitBid({ auctionId: auction.id, amount: BigInt(amount) })
-      .catch(logFailure(`bid on auction ${auction.id}`));
-    console.log(
-      `[${BOT_NAME}] bid ${amount} on '${auction.letter}' (match ${matchId}, auction ${auction.id})`,
-    );
+      })
+      .catch(logFailure("planning turn"))
+      .finally(() => queueTurn(conn));
   }
 }
 
-function onConnect(conn: DbConnection, identity: Identity, token: string) {
+function activeParticipant(conn: DbConnection, matchId: bigint, turn: Turn) {
+  if (
+    conn !== connection ||
+    !ready ||
+    turns.get(matchId) !== turn ||
+    performance.now() >= turn.deadline
+  )
+    return;
+  const match = conn.db.matchState.id.find(matchId);
+  if (
+    match?.status.tag !== "Running" ||
+    match.currentAuctionId !== turn.auctionId
+  )
+    return;
+  return conn.db.matchParticipant.id.find(turn.participantId);
+}
+
+function submitTurnBid(
+  conn: DbConnection,
+  matchId: bigint,
+  turn: Turn,
+  target: number,
+  retry = true,
+) {
+  const participant = activeParticipant(conn, matchId, turn);
+  if (!participant) return;
+  const amount = BigInt(Math.min(target, Number(participant.balance)));
+  if (retry && amount === (turn.bid ?? 0n)) return;
+  turn.bid = amount;
+  console.log(
+    `[${BOT_NAME}] bid ${amount} (match ${matchId}, auction ${turn.auctionId})`,
+  );
+  void conn.reducers
+    .submitBid({ auctionId: turn.auctionId, amount })
+    .catch((error: unknown) => {
+      logFailure(`bid on auction ${turn.auctionId}`)(error);
+      if (
+        retry &&
+        turn.bid === amount &&
+        turn.deadline - performance.now() > BID_MARGIN_MS
+      ) {
+        submitTurnBid(conn, matchId, turn, target, false);
+      }
+    });
+}
+
+function onConnect(
+  conn: DbConnection,
+  identity: Identity,
+  connectedToken: string,
+) {
+  connection = conn;
+  reconnectDelay = 500;
   myIdentity = identity;
-  saveToken(token);
+  token = connectedToken;
+  saveToken(connectedToken);
   console.log(`[${BOT_NAME}] connected as ${identity.toHexString()}`);
 
   conn
@@ -244,6 +365,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
             .catch(logFailure("claiming the credential"));
           // Wait briefly for the credential to land; check again.
           setTimeout(() => {
+            if (conn !== connection) return;
             myBotId = resolveMyBotId(conn);
             if (myBotId === null) {
               console.error(
@@ -301,15 +423,17 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   conn.db.matchState.onInsert(() => queueLifecycle(conn));
   conn.db.matchState.onUpdate((_ctx, old, neu) => {
     if (old.status.tag !== neu.status.tag) queueLifecycle(conn);
+    if (old.currentAuctionId !== neu.currentAuctionId) queueTurn(conn);
   });
 }
 
 function queueLifecycle(conn: DbConnection) {
-  if (!ready || lifecycleQueued) return;
+  if (conn !== connection || !ready || lifecycleQueued) return;
   lifecycleQueued = true;
   queueMicrotask(() => {
     lifecycleQueued = false;
-    if (ready && !syncMatchFeeds(conn) && !TOURNAMENT_ID) joinLobby(conn);
+    if (conn === connection && ready && !syncMatchFeeds(conn) && !TOURNAMENT_ID)
+      joinLobby(conn);
   });
 }
 
@@ -321,8 +445,8 @@ function syncMatchFeeds(conn: DbConnection): boolean {
     if (match?.status.tag !== "Running") {
       if (feed) {
         matchFeeds.delete(matchId);
-        lastBid.delete(matchId);
-        failedWords.delete(matchId);
+        clearTimeout(turns.get(matchId)?.timer);
+        turns.delete(matchId);
         feed.handle.unsubscribe();
         console.log(
           `[${BOT_NAME}] match ${matchId} ended with ${score} points`,
@@ -442,20 +566,43 @@ function bootstrapActivity(conn: DbConnection) {
 
 function main() {
   console.log(`[${BOT_NAME}] connecting to ${DB_NAME} at ${HOST}`);
-  DbConnection.builder()
+  const next = DbConnection.builder()
     .withUri(HOST)
     .withDatabaseName(DB_NAME)
-    .withToken(BOT_TOKEN ?? loadToken())
+    .withToken(token)
     .onConnect(onConnect)
-    .onConnectError((_ctx: ErrorContext, err: Error) =>
-      console.error("connect error:", err.message),
-    )
+    .onConnectError((_ctx: ErrorContext, err: Error) => {
+      console.error("connect error:", err.message);
+      scheduleReconnect();
+    })
     .onDisconnect(() => {
+      if (connection !== next) return;
+      connection = undefined;
       ready = false;
       clearInterval(lobbyPoll);
+      for (const turn of turns.values()) clearTimeout(turn.timer);
+      turns.clear();
+      matchFeeds.clear();
+      pendingWords.clear();
+      myIdentity = null;
+      myBotId = null;
+      joinRequestedAt = undefined;
+      nextJoinAttempt = 0;
+      queuedLobby = undefined;
       console.log(`[${BOT_NAME}] disconnected`);
+      scheduleReconnect();
     })
     .build();
+}
+
+let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = undefined;
+    main();
+  }, reconnectDelay);
+  reconnectDelay = Math.min(15_000, reconnectDelay * 2);
 }
 
 main();

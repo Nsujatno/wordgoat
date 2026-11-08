@@ -40,6 +40,7 @@ export function rackCounts(rack: ReadonlyMap<string, number>): number[] {
 export interface Play {
   word: string;
   letters: number[];
+  mask: number;
   face: number;
   score: number;
 }
@@ -72,11 +73,17 @@ export class Lexicon {
         node = child;
       }
       if (node.play) continue;
-      const face = letters.reduce((sum, letter) => sum + VALUES[letter], 0);
+      let face = 0;
+      let mask = 0;
+      for (const letter of letters) {
+        face += VALUES[letter];
+        mask |= 1 << letter;
+      }
       const multiplier = Math.min(6, Math.max(2, letters.length - 1));
       node.play = {
         word,
         letters,
+        mask,
         face,
         score: Math.floor((face * multiplier) / 2),
       };
@@ -87,23 +94,25 @@ export class Lexicon {
   // A single traversal handles both ordinary plays and all one-tile upgrades.
   visit(
     counts: number[],
-    report: (play: Play, missing: number) => void,
+    report: (play: Play, missing: number, leaveCost: number) => void,
     available?: readonly number[],
+    copyCosts?: readonly (readonly number[])[],
   ): void {
-    const search = (node: Node, missing: number) => {
-      if (node.play) report(node.play, missing);
+    const search = (node: Node, missing: number, leaveCost: number) => {
+      if (node.play) report(node.play, missing, leaveCost);
       for (let child = node.child; child; child = child.sibling) {
         const letter = child.letter;
         if (counts[letter] > 0) {
+          const cost = copyCosts?.[letter][counts[letter]] ?? 0;
           counts[letter]--;
-          search(child, missing);
+          search(child, missing, leaveCost + cost);
           counts[letter]++;
         } else if (missing < 0 && available && available[letter] > 0) {
-          search(child, letter);
+          search(child, letter, leaveCost);
         }
       }
     };
-    search(this.root, -1);
+    search(this.root, -1, 0);
   }
 }
 
@@ -120,9 +129,27 @@ export interface CashOut {
   plays: Play[];
 }
 
+const recentPacks = new WeakMap<Lexicon, Map<string, CashOut>>();
+
+export function cashOut(lexicon: Lexicon, counts: number[]): CashOut {
+  let cache = recentPacks.get(lexicon);
+  if (!cache) {
+    cache = new Map();
+    recentPacks.set(lexicon, cache);
+  }
+  const key = String.fromCharCode(...counts);
+  let pack = cache.get(key);
+  if (!pack) {
+    pack = searchCashOut(lexicon, counts);
+    if (cache.size >= 64) cache.delete(cache.keys().next().value!);
+    cache.set(key, pack);
+  }
+  return { score: pack.score, plays: [...pack.plays] };
+}
+
 // Pack disjoint words rather than consuming a high-scoring word that blocks
 // a better combination. The search keeps a legal incumbent under its work cap.
-export function cashOut(lexicon: Lexicon, counts: number[]): CashOut {
+function searchCashOut(lexicon: Lexicon, counts: number[]): CashOut {
   const plays: Play[] = [];
   lexicon.visit(counts, (play) => plays.push(play));
   plays.sort(
@@ -150,15 +177,16 @@ export function cashOut(lexicon: Lexicon, counts: number[]): CashOut {
 
     // Every solution uses this letter in a word or leaves one copy unused.
     let pivot = -1;
+    let mask = 0;
     for (let letter = 0; letter < counts.length; letter++) {
-      if (
-        counts[letter] &&
-        (pivot < 0 || byLetter[letter].length < byLetter[pivot].length)
-      )
+      if (!counts[letter]) continue;
+      mask |= 1 << letter;
+      if (pivot < 0 || byLetter[letter].length < byLetter[pivot].length)
         pivot = letter;
     }
     for (const play of byLetter[pivot]) {
       if (--work < 0) break;
+      if ((mask & play.mask) !== play.mask) continue;
       if (score + play.score + 3 * (face - play.face) <= best.score) continue;
       spend(counts, play);
       if (play.letters.every((letter) => counts[letter] >= 0)) {

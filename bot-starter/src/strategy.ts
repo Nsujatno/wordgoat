@@ -40,12 +40,22 @@ const FLEXIBILITY = [
   1.0, -1.1, 1.5, 2.0, 1.5, 0.0, 0.1, 0.2, -0.4, 0.6, -0.2,
 ];
 const VOWELS = "AEIOU";
+const TILE_CREDITS = VALUES.map((face, slot) =>
+  Math.max(0.7, 0.85 * face + FLEXIBILITY[slot]),
+);
+const MAX_RACK_COPIES = Math.max(...BAG_COUNTS) + 1;
+const COPY_COSTS = TILE_CREDITS.map((credit) => {
+  const costs = Array<number>(MAX_RACK_COPIES + 1).fill(0.65 * credit);
+  costs[1] = credit;
+  return costs;
+});
 
 function tileCredit(letter: number, count: number): number {
   // Duplicates compete for the same hooks. High-face tiles still have value
   // in a good word, which rackEquity accounts for separately below.
-  const credit = Math.max(0.7, 0.85 * VALUES[letter] + FLEXIBILITY[letter]);
-  return credit * (Math.min(count, 1) + 0.65 * Math.max(0, count - 1));
+  return (
+    TILE_CREDITS[letter] * (Math.min(count, 1) + 0.65 * Math.max(0, count - 1))
+  );
 }
 
 function rackEquity(
@@ -61,23 +71,8 @@ function rackEquity(
   let surplus = 0;
   lexicon.visit(
     counts,
-    (play, missing) => {
-      // During a visit the counts are the leave, since the trie has already
-      // used the word's tiles. Credit only the copies still on the rack.
-      let leave = credit;
-      for (let i = 0; i < play.letters.length; ) {
-        const letter = play.letters[i];
-        let used = 0;
-        while (play.letters[i] === letter) {
-          used++;
-          i++;
-        }
-        if (letter === missing) used--;
-        leave +=
-          tileCredit(letter, counts[letter]) -
-          tileCredit(letter, counts[letter] + used);
-      }
-      const gain = play.score + leave - credit;
+    (play, missing, leaveCost) => {
+      const gain = play.score - leaveCost;
       if (missing < 0) {
         surplus = Math.max(surplus, gain);
       } else {
@@ -92,6 +87,7 @@ function rackEquity(
       }
     },
     available,
+    COPY_COSTS,
   );
   return credit + surplus;
 }
@@ -395,4 +391,31 @@ export function choosePlays(ctx: Position): Play[] {
     if (waitForRevealedTile(ctx, counts, best, price)) return [];
   }
   return best ? [best] : [];
+}
+
+// Use the extra window when winning the penultimate tile cannot improve
+// the rack's terminal payout. A missed final event then costs no points.
+export function chooseTournamentPlays(ctx: Position): Play[] {
+  const planned = choosePlays(ctx);
+  if (planned.length || ctx.bagTotal !== 1 || !ctx.letter) return planned;
+  const slot = ALPHABET.indexOf(ctx.letter);
+  if (ctx.letter.length !== 1 || slot < 0) return planned;
+  const counts = rackCounts(ctx.myRack);
+  const pack = cashOut(ctx.lexicon, counts);
+  if (!pack.plays.length || ctx.myBalance < 1) return pack.plays;
+  counts[slot]++;
+  return cashOut(ctx.lexicon, counts).score > pack.score ? [] : pack.plays;
+}
+
+export function decideTournamentBid(ctx: BidContext): number {
+  // One later window remains to score this tile, but no later tile can be
+  // scored by an external bot. Unspent cash has no value after this auction.
+  // A win also denies the tile to an opponent who could improve their place.
+  if (
+    ctx.bagTotal === 1 &&
+    ctx.letter.length === 1 &&
+    ALPHABET.includes(ctx.letter)
+  )
+    return Math.max(0, Math.floor(ctx.myBalance));
+  return decideBid(ctx);
 }
