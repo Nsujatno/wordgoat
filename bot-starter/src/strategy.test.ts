@@ -167,6 +167,120 @@ test("first-price bidding shades a bid for a valuable completion and respects th
   assert.equal(decideBid({ ...ctx, myBalance: 1 }), 1);
 });
 
+test("early and middle-game bonus targets stay intact while cash is available", () => {
+  const lexicon = new Lexicon([
+    "JOINERS",
+    "HAYWIRE",
+    "GINGHAM",
+    "VANISHED",
+    "REJOINED",
+    "FISHWAY",
+    "HOMAGING",
+    "HARVESTING",
+  ]);
+  const losses = Array.from({ length: 12 }, () => ({
+    letter: "E",
+    paid: 12,
+    result: "lost" as const,
+  }));
+  for (const [letters, balance, word] of [
+    ["EIIJNORS", 40, "JOINERS"],
+    ["AEFHIRWY", 39, "HAYWIRE"],
+    ["AEGGHIMNN", 42, "GINGHAM"],
+    ["ADEHINSV", 44, "VANISHED"],
+  ] as const) {
+    const ctx = {
+      myRack: rack(letters),
+      myBalance: balance,
+      bagTotal: 40,
+      lexicon,
+      auctionType: "Vickrey" as const,
+      market: losses,
+    };
+    assert.deepEqual(choosePlays(ctx), []);
+    assert.equal(choosePlays({ ...ctx, myBalance: 20 })[0]?.word, word);
+    assert.deepEqual(
+      choosePlays({ ...ctx, bagTotal: 46 }),
+      [],
+      "build for the larger bonus early",
+    );
+    assert.deepEqual(
+      choosePlays({ ...ctx, bagTotal: 18 }),
+      [],
+      "avoid restarting a funded rack late",
+    );
+    assert.deepEqual(
+      choosePlays({ ...ctx, myBalance: 50 }),
+      [],
+      "retain the larger payout target while funded",
+    );
+  }
+});
+
+test("a dry spell alone does not force a low-value seven-letter payout", () => {
+  assert.deepEqual(
+    choosePlays({
+      myRack: rack("RETAINS"),
+      myBalance: 40,
+      bagTotal: 40,
+      lexicon: new Lexicon(["RETAINS"]),
+      market: Array.from({ length: 20 }, () => ({
+        letter: "E",
+        paid: 12,
+        result: "lost" as const,
+      })),
+    }),
+    [],
+  );
+});
+
+test("first-price endgame preserves funded combinations, liquidates when needed, and always cashes out at the end", () => {
+  const ctx = {
+    myRack: rack("QUARTS"),
+    myBalance: 20,
+    bagTotal: 15,
+    lexicon: new Lexicon(["QUARTS"]),
+    auctionType: "FirstPrice" as const,
+    market: Array.from({ length: 3 }, () => ({
+      letter: "E",
+      paid: 3,
+      result: "lost" as const,
+    })),
+  };
+  assert.deepEqual(choosePlays(ctx), []);
+  assert.equal(choosePlays({ ...ctx, bagTotal: 19 })[0]?.word, "QUARTS");
+  assert.equal(choosePlays({ ...ctx, myBalance: 10 })[0]?.word, "QUARTS");
+  assert.deepEqual(choosePlays({ ...ctx, auctionType: "Vickrey" }), []);
+  assert.equal(choosePlays({ ...ctx, bagTotal: 0 })[0]?.word, "QUARTS");
+});
+
+test("Vickrey preserves a funded late rack while first-price reserves two purchases", () => {
+  const ctx = {
+    myRack: rack("FISHWAY"),
+    myBalance: 20,
+    bagTotal: 18,
+    lexicon: new Lexicon(["FISHWAY"]),
+    auctionType: "Vickrey" as const,
+    market: Array.from({ length: 3 }, () => ({
+      letter: "E",
+      paid: 12,
+      result: "lost" as const,
+    })),
+  };
+  assert.deepEqual(choosePlays(ctx), []);
+  assert.equal(choosePlays({ ...ctx, bagTotal: 19 })[0]?.word, "FISHWAY");
+  assert.equal(choosePlays({ ...ctx, myBalance: 11 })[0]?.word, "FISHWAY");
+  assert.equal(
+    choosePlays({ ...ctx, auctionType: "FirstPrice" })[0]?.word,
+    "FISHWAY",
+  );
+  assert.deepEqual(
+    choosePlays({ ...ctx, auctionType: "FirstPrice", myBalance: 24 }),
+    [],
+  );
+  assert.equal(choosePlays({ ...ctx, bagTotal: 0 })[0]?.word, "FISHWAY");
+});
+
 test("indexed bidding and final cash-out fit comfortably in an auction window", () => {
   const dictionary = readFileSync(
     new URL("../../spacetimedb/wordlist.txt", import.meta.url),

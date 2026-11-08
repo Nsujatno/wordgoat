@@ -10,3 +10,5 @@ target/
 bot-starter/src/module_bindings/
 .vercel
 .env*
+bot-starter/analysis/v3-decisions.json
+bot-starter/analysis/v3-analysis.txt

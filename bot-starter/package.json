@@ -8,6 +8,7 @@
     "start": "tsx src/index.ts",
     "test": "node --import tsx --test src/strategy.test.ts",
     "benchmark": "tsx src/benchmark.ts",
+    "analyze:replays": "tsx src/analyze-replays.ts",
     "build": "tsc"
   },
   "dependencies": {

@@ -8,6 +8,7 @@ Each released version is pinned to a Git commit in [the version registry](src/ve
 | --- | --- | ---: | ---: | ---: |
 | v1 | `0827890` | 0/5 | 2.60 | 85.8 |
 | v2 | `96462d6` | 3/6 | 1.83 | 101.0 |
+| v3 | `0f58d7d` | 3/8 | 2.63 | 93.4 |
 
 | Version | Place | Wordgoat points | Highest-scoring rival | Replay |
 | --- | ---: | ---: | --- | --- |
@@ -66,6 +67,14 @@ The all-version Vickrey benchmark used 96 games per matchup. Outright wins in th
 | v2 | 53–43 | 49–47 | 44 / 42 |
 
 First-price results stayed even across the three strategies. The candidate is the working strategy for the next live test batch.
+
+## V3 live review and v4 candidate
+
+The eight v3 games (43006, 43011, 43016, 43022, 43028, 43034, 43040, 43046) averaged 71.25 points in the first four and 115.5 in the last four. All 103 winning bid caps match the pinned v3 code. Large-word timing, starting tiles, and different opponent fields explain the change; there is no cross-match learning.
+
+The working v4 candidate makes a small endgame change: with 18 or fewer letters left, it preserves a playable rack when cash covers the estimated purchase reserve, then liquidates on the final auction. Broader early-payout changes were rejected after they hurt other deals. Fresh competitive tests improved average scores in both formats and improved or preserved the bottom-decile averages. These are local improvements; no v4 live results are recorded yet.
+
+See the [full analysis and validation](analysis/V3_REVIEW.md) for the match evidence, exact phase rules, limitations, and reproducible commands. `npm run analyze:replays` rechecks the archived batch; `npm run benchmark -- --robust v3` compares scoring and consistency across six fields in both formats.
 
 ## Run the comparison
 

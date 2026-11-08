@@ -65,7 +65,7 @@ function rackEquity(
       // During a visit the counts are the leave, since the trie has already
       // used the word's tiles. Credit only the copies still on the rack.
       let leave = credit;
-      for (let i = 0; i < play.letters.length;) {
+      for (let i = 0; i < play.letters.length; ) {
         const letter = play.letters[i];
         let used = 0;
         while (play.letters[i] === letter) {
@@ -315,9 +315,14 @@ export function choosePlays(ctx: Position): Play[] {
   if (tiles < 2) return [];
   if (ctx.bagTotal === 0) return cashOut(ctx.lexicon, counts).plays;
 
-  // Keep hooks for late acquisitions when we already have enough to bid.
-  if (ctx.bagTotal <= 7 && ctx.myBalance >= 6 * ctx.bagTotal) return [];
   const secondPrice = ctx.auctionType !== "FirstPrice";
+  const price = commonTilePrice(ctx.market);
+  // Protect a funded rack in the endgame: there is little time to rebuild.
+  const holdHorizon = 18;
+  const holdBudget = secondPrice
+    ? Math.min(6 * ctx.bagTotal, Math.max(12, price))
+    : Math.min(6 * ctx.bagTotal, Math.max(12, 2 * price));
+  if (ctx.bagTotal <= holdHorizon && ctx.myBalance >= holdBudget) return [];
   const canWait = ctx.bagTotal > 5 && ctx.myBalance >= 28;
   const minimumLength =
     ctx.myBalance < 7
@@ -357,7 +362,6 @@ export function choosePlays(ctx: Position): Play[] {
     }
   });
   if (secondPrice && best) {
-    const price = commonTilePrice(ctx.market);
     // For a strong ready word, wait for a one-tile upgrade only when its
     // extra payout can cover the expected cost of the missing letter.
     if (

@@ -42,4 +42,20 @@ export const botVersions: readonly BotVersion[] = [
       { id: 42887, place: 3, score: 77, bestRivalScore: 142 },
     ],
   },
+  {
+    id: "v3",
+    commit: "0f58d7ded41a270e0108ba6119fe2d567c5eb28d",
+    description:
+      "Cost-aware upgrades and revealed-tile protection, with a fixed 50-point payout floor",
+    liveMatches: [
+      { id: 43006, place: 5, score: 64, bestRivalScore: 107 },
+      { id: 43011, place: 2, score: 91, bestRivalScore: 110 },
+      { id: 43016, place: 4, score: 67, bestRivalScore: 125 },
+      { id: 43022, place: 4, score: 63, bestRivalScore: 109 },
+      { id: 43028, place: 1, score: 99, bestRivalScore: 89 },
+      { id: 43034, place: 1, score: 141, bestRivalScore: 92 },
+      { id: 43040, place: 1, score: 120, bestRivalScore: 103 },
+      { id: 43046, place: 3, score: 102, bestRivalScore: 123 },
+    ],
+  },
 ];

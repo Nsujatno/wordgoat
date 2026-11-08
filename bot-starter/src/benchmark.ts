@@ -149,15 +149,17 @@ function runMatch(
     Array<string>(count).fill(ALPHABET[index]),
   );
   const draw = () => bag.splice(Math.floor(drawRandom() * bag.length), 1)[0];
-  const players = seats.map((policy): Player => ({
-    policy,
-    rack: new Map(),
-    starting: [],
-    balance: 100,
-    score: 0,
-    wonLast: false,
-    market: [],
-  }));
+  const players = seats.map(
+    (policy): Player => ({
+      policy,
+      rack: new Map(),
+      starting: [],
+      balance: 100,
+      score: 0,
+      wonLast: false,
+      market: [],
+    }),
+  );
   for (const player of players) {
     for (let i = 0; i < 5; i++) awardTile(player, draw());
     player.starting = rackCounts(player.rack);
@@ -277,7 +279,7 @@ function runMatch(
   return players.map((player) => player.score);
 }
 
-async function loadStrategy(ref: string): Promise<Strategy> {
+export async function loadStrategy(ref: string): Promise<Strategy> {
   const cwd = fileURLToPath(new URL("../..", import.meta.url));
   const git = (...args: string[]) =>
     execFileSync("git", args, {
@@ -342,7 +344,17 @@ async function loadStrategy(ref: string): Promise<Strategy> {
 
 const auctionTypes = ["Vickrey", "FirstPrice"] as const;
 const pressureOpponents = Array<Policy>(5).fill("pressure");
-const games = 96;
+const games = Number(process.env.BENCH_GAMES ?? 96);
+const seedShift = Number(process.env.BENCH_SEED_OFFSET ?? 0);
+if (
+  !Number.isSafeInteger(games) ||
+  games < 2 ||
+  games % 2 ||
+  !Number.isSafeInteger(seedShift)
+)
+  throw new Error(
+    "BENCH_GAMES must be a positive even integer; BENCH_SEED_OFFSET must be an integer",
+  );
 
 function headToHead(left: Entrant, right: Entrant, reference: WordSearch) {
   const rooms = [
@@ -358,7 +370,7 @@ function headToHead(left: Entrant, right: Entrant, reference: WordSearch) {
       const firsts = [0, 0];
       const points = [0, 0];
       for (let deal = 0; deal < games / 2; deal++) {
-        const seed = (deal + 7300) * 7919;
+        const seed = (deal + 7300 + seedShift) * 7919;
         for (const seat of [0, 1]) {
           const pair =
             seat === 0
@@ -419,8 +431,9 @@ function benchmarkField(
   let ties = 0;
   let points = 0;
   let rivalPoints = 0;
+  const scoresByGame: number[] = [];
   for (let game = 1; game <= games; game++) {
-    const seed = (game + seedOffset) * 7919;
+    const seed = (game + seedOffset + seedShift) * 7919;
     const seat = seed % (opponents.length + 1);
     const seats = [...opponents];
     seats.splice(seat, 0, entrant.strategy);
@@ -431,13 +444,93 @@ function benchmarkField(
     ties += Number(score === bestRival);
     points += score;
     rivalPoints += bestRival;
+    scoresByGame.push(score);
   }
+  const sorted = [...scoresByGame].sort((a, b) => a - b);
+  const tailSize = Math.max(1, Math.ceil(games / 10));
   return {
     wins,
     ties,
     average: points / games,
     rivalAverage: rivalPoints / games,
+    bottomDecile:
+      sorted.slice(0, tailSize).reduce((a, b) => a + b, 0) / tailSize,
+    below60: sorted.filter((score) => score < 60).length,
+    scoresByGame,
   };
+}
+
+async function benchmarkRobustness(ref: string) {
+  const registered = botVersions.find((version) => version.id === ref);
+  const baseline = {
+    name: ref,
+    strategy: await loadStrategy(registered?.commit ?? ref),
+  };
+  const rooms: Record<string, Policy[]> = {
+    ...fields,
+    "Five pressure bots": pressureOpponents,
+    "Mixed pressure": [
+      "pressure",
+      "pressure",
+      "hoarder",
+      "starter",
+      "aggressive",
+    ],
+    "Pressure duel": ["pressure"],
+  };
+  const report = [];
+  for (const [field, opponents] of Object.entries(rooms)) {
+    if (
+      process.env.BENCH_FIELDS &&
+      !process.env.BENCH_FIELDS.toLowerCase()
+        .split(",")
+        .some((filter) => field.toLowerCase().includes(filter.trim()))
+    )
+      continue;
+    for (const auctionType of auctionTypes) {
+      const before = benchmarkField(
+        baseline,
+        opponents,
+        auctionType,
+        10300,
+        baseline.strategy,
+      );
+      const after = benchmarkField(
+        current,
+        opponents,
+        auctionType,
+        10300,
+        baseline.strategy,
+      );
+      const differences = after.scoresByGame.map(
+        (score, i) => score - before.scoresByGame[i],
+      );
+      const mean = after.average - before.average;
+      const se = Math.sqrt(
+        differences.reduce((s, d) => s + (d - mean) ** 2, 0) /
+          (games - 1) /
+          games,
+      );
+      console.log(
+        `${field}, ${auctionType}: average ${before.average.toFixed(1)} -> ${after.average.toFixed(1)}; bottom 10% ${before.bottomDecile.toFixed(1)} -> ${after.bottomDecile.toFixed(1)}; wins ${before.wins} -> ${after.wins}/${games}; below 60 ${before.below60} -> ${after.below60}; paired gain ${mean.toFixed(1)} ± ${(1.96 * se).toFixed(1)}`,
+      );
+      report.push({
+        field,
+        auctionType,
+        games,
+        seedShift,
+        before,
+        after,
+        pairedGain: mean,
+        paired95HalfWidth: 1.96 * se,
+      });
+    }
+  }
+  if (process.env.BENCH_REPORT)
+    writeFileSync(
+      process.env.BENCH_REPORT,
+      JSON.stringify(report, null, 2) + "\n",
+    );
 }
 
 async function benchmarkVersions(includeCandidate: boolean) {
@@ -490,44 +583,54 @@ async function benchmarkVersions(includeCandidate: boolean) {
   }
 }
 
-const args = process.argv.slice(2);
-const [flag, ref] = args;
-if (flag === "--against" && ref && args.length === 2) {
-  const registered = botVersions.find((version) => version.id === ref);
-  headToHead(
-    current,
-    {
-      name: ref,
-      strategy: await loadStrategy(registered?.commit ?? ref),
-    },
-    current.strategy,
-  );
-} else if (
-  flag === "--versions" &&
-  (args.length === 1 || (args.length === 2 && ref === "--candidate"))
-) {
-  await benchmarkVersions(ref === "--candidate");
-} else if (!flag) {
-  for (const [field, opponents] of Object.entries(fields)) {
-    for (const auctionType of auctionTypes) {
-      const { wins, ties, average, rivalAverage } = benchmarkField(
-        current,
-        opponents,
-        auctionType,
-        3000,
-        current.strategy,
-      );
-      console.log(
-        `${field}, ${auctionType}. ${wins}/${games} outright wins, ${ties} ties for first. Average points ${average.toFixed(1)} vs. ${rivalAverage.toFixed(1)} for the best rival.`,
-      );
+async function main() {
+  const args = process.argv.slice(2);
+  const [flag, ref] = args;
+  if (flag === "--robust" && args.length <= 2) {
+    await benchmarkRobustness(ref ?? "v3");
+  } else if (flag === "--against" && ref && args.length === 2) {
+    const registered = botVersions.find((version) => version.id === ref);
+    headToHead(
+      current,
+      {
+        name: ref,
+        strategy: await loadStrategy(registered?.commit ?? ref),
+      },
+      current.strategy,
+    );
+  } else if (
+    flag === "--versions" &&
+    (args.length === 1 || (args.length === 2 && ref === "--candidate"))
+  ) {
+    await benchmarkVersions(ref === "--candidate");
+  } else if (!flag) {
+    for (const [field, opponents] of Object.entries(fields)) {
+      for (const auctionType of auctionTypes) {
+        const { wins, ties, average, rivalAverage } = benchmarkField(
+          current,
+          opponents,
+          auctionType,
+          3000,
+          current.strategy,
+        );
+        console.log(
+          `${field}, ${auctionType}. ${wins}/${games} outright wins, ${ties} ties for first. Average points ${average.toFixed(1)} vs. ${rivalAverage.toFixed(1)} for the best rival.`,
+        );
+      }
     }
+  } else {
+    throw new Error(
+      "Usage: npm run benchmark -- [--versions [--candidate] | --against <version-or-commit> | --robust [version-or-commit]]",
+    );
   }
-} else {
-  throw new Error(
-    "Usage: npm run benchmark -- [--versions [--candidate] | --against <version-or-commit>]",
+  timings.sort((a, b) => a - b);
+  console.log(
+    `Strategy time per turn: p95 ${timings[Math.floor(timings.length * 0.95)].toFixed(2)} ms, max ${timings.at(-1)?.toFixed(2)} ms`,
   );
 }
-timings.sort((a, b) => a - b);
-console.log(
-  `Strategy time per turn: p95 ${timings[Math.floor(timings.length * 0.95)].toFixed(2)} ms, max ${timings.at(-1)?.toFixed(2)} ms`,
-);
+
+if (
+  process.argv[1] &&
+  pathToFileURL(resolve(process.argv[1])).href === import.meta.url
+)
+  await main();

@@ -1,0 +1,9 @@
+
+> scrabblebot-bot-starter@0.1.0 benchmark
+> tsx src/benchmark.ts --against v3
+
+Two-bot duel, Vickrey. working tree 50–46 v3, 0 ties. Average points 243.2–237.0.
+Two-bot duel, FirstPrice. working tree 49–47 v3, 0 ties. Average points 236.1–233.4.
+Six-bot pressure table, Vickrey. working tree 50–45 v3, 1 ties. Outright table wins 45–39. Average points 87.9–87.0.
+Six-bot pressure table, FirstPrice. working tree 49–43 v3, 4 ties. Outright table wins 34–29. Average points 80.1–78.4.
+Strategy time per turn: p95 7.02 ms, max 114.02 ms
