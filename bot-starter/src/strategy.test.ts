@@ -281,6 +281,35 @@ test("Vickrey preserves a funded late rack while first-price reserves two purcha
   assert.equal(choosePlays({ ...ctx, bagTotal: 0 })[0]?.word, "FISHWAY");
 });
 
+test("midgame Vickrey cashes compact 48-point words and preserves seed tiles over over-stuffed words", () => {
+  const compact = choosePlays({
+    myRack: rack("AAEILNORSTX"),
+    myBalance: 45,
+    bagTotal: 44,
+    lexicon: new Lexicon(["RELAXATION", "RELAXATIONS"]),
+    auctionType: "Vickrey" as const,
+  });
+  assert.equal(compact[0]?.word, "RELAXATION");
+
+  const midgame48 = choosePlays({
+    myRack: rack("CEHIIRTW"),
+    myBalance: 38,
+    bagTotal: 38,
+    lexicon: new Lexicon(["WITCHIER"]),
+    auctionType: "Vickrey" as const,
+  });
+  assert.equal(midgame48[0]?.word, "WITCHIER");
+
+  const endgameBloated = choosePlays({
+    myRack: rack("ABEKMRSTY"),
+    myBalance: 20,
+    bagTotal: 17,
+    lexicon: new Lexicon(["EMBARKS"]),
+    auctionType: "Vickrey" as const,
+  });
+  assert.equal(endgameBloated[0]?.word, "EMBARKS");
+});
+
 test("indexed bidding and final cash-out fit comfortably in an auction window", () => {
   const dictionary = readFileSync(
     new URL("../../spacetimedb/wordlist.txt", import.meta.url),

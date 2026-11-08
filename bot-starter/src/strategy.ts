@@ -260,7 +260,7 @@ export function decideBid(ctx: BidContext): number {
   const unsupportedQ =
     ctx.letter === "Q" && !counts[ALPHABET.indexOf("U")] && improvement < 14;
   const scoringPremium = secondPrice
-    ? 2 * (face - 1) * (unsupportedQ ? 0.35 : 1) * (copies ? 0.5 : 1)
+    ? 2.15 * (face - 1) * (unsupportedQ ? 0.35 : 1) * (copies ? 0.5 : 1)
     : 0;
   const immediate = improvement * (ctx.bagTotal < 8 ? 1.65 : 1.1);
   const urgency = Math.max(0, 1 - ctx.bagTotal / 22);
@@ -317,12 +317,20 @@ export function choosePlays(ctx: Position): Play[] {
 
   const secondPrice = ctx.auctionType !== "FirstPrice";
   const price = commonTilePrice(ctx.market);
-  // Protect a funded rack in the endgame: there is little time to rebuild.
+  // Protect a funded rack in the endgame: there is little time to rebuild,
+  // unless a large rack has low cash and already holds a strong payout.
   const holdHorizon = 18;
   const holdBudget = secondPrice
     ? Math.min(6 * ctx.bagTotal, Math.max(12, price))
     : Math.min(6 * ctx.bagTotal, Math.max(12, 2 * price));
-  if (ctx.bagTotal <= holdHorizon && ctx.myBalance >= holdBudget) return [];
+  const unlockEndgame =
+    secondPrice && ctx.bagTotal >= 5 && tiles >= 9 && ctx.myBalance < 28;
+  if (
+    ctx.bagTotal <= holdHorizon &&
+    ctx.myBalance >= holdBudget &&
+    !unlockEndgame
+  )
+    return [];
   const canWait = ctx.bagTotal > 5 && ctx.myBalance >= 28;
   const minimumLength =
     ctx.myBalance < 7
@@ -337,12 +345,20 @@ export function choosePlays(ctx: Position): Play[] {
 
   let best: Play | undefined;
   let bestValue = -Infinity;
+  const seedBonusPerTile = secondPrice && ctx.bagTotal >= 18 ? 1.0 : 0;
   ctx.lexicon.visit(counts, (play) => {
     const length = play.letters.length;
     const largePayout = secondPrice && length >= 5 && play.score >= 42;
     if (length < minimumLength && !largePayout) return;
+    if (unlockEndgame && play.score < 42) return;
     if (secondPrice) {
-      if (canWait && play.score < 50) return;
+      const waitFloor =
+        length <= 8 &&
+        (ctx.bagTotal <= 38 ||
+          (tiles >= 9 && ctx.bagTotal <= 44 && ctx.myBalance < 42))
+          ? 48
+          : 50;
+      if (canWait && play.score < waitFloor) return;
     } else if (
       length >= 7 &&
       tiles < 10 &&
@@ -355,7 +371,12 @@ export function choosePlays(ctx: Position): Play[] {
       (sum, count, letter) => sum + tileCredit(letter, count),
       0,
     );
-    const value = play.score + 0.95 * leave + 0.15 * length;
+    const kept = Math.min(4, tiles - length);
+    const value =
+      play.score +
+      0.95 * leave +
+      kept * seedBonusPerTile +
+      0.15 * Math.min(7, length);
     if (value > bestValue) {
       best = play;
       bestValue = value;
@@ -364,9 +385,10 @@ export function choosePlays(ctx: Position): Play[] {
   if (secondPrice && best) {
     // For a strong ready word, wait for a one-tile upgrade only when its
     // extra payout can cover the expected cost of the missing letter.
+    const upgradeCap = tiles >= 9 && ctx.myBalance < 38 ? 48 : 57;
     if (
-      canWait &&
-      best.score < 57 &&
+      (canWait || unlockEndgame) &&
+      best.score < upgradeCap &&
       hasProfitableUpgrade(ctx, counts, best.score, price)
     )
       return [];
